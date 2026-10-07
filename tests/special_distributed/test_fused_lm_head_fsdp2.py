@@ -17,6 +17,8 @@
 Exercise the real model, fused kernels and independently sharded FSDP2 head.
 References use the original HF logits forward and the same fused kernel with
 the head owned by the root FSDP unit, both under the same mixed precision policy.
+Unfused updates start at the same weights; the same-kernel reference follows
+an independent two-step training trajectory.
 No pretrained weights or dataset downloads are needed.
 """
 
@@ -162,6 +164,12 @@ def test_fused_head_matches_logits(model_type, backend, offload, tied, reference
     optim = torch.optim.SGD(model.parameters(), lr=0.1)
     ref_optim = torch.optim.SGD(reference.parameters(), lr=0.1)
     for step in range(2):
+        if step and reference_kind == "logits":
+            # Compare gradients at the same weights, without compounding the
+            # previous update's BF16 rounding between fused and HF logits.
+            with torch.no_grad():
+                for param, ref_param in zip(model.parameters(), reference.parameters(), strict=True):
+                    ref_param.to_local().copy_(param.to_local())
         optim.zero_grad(set_to_none=True)
         ref_optim.zero_grad(set_to_none=True)
         for microbatch in range(2):
@@ -214,13 +222,21 @@ def test_fused_head_matches_logits(model_type, backend, offload, tied, reference
                 # Triton accumulates/scales logits in FP32; the ordinary HF
                 # path rounds the projection and temperature division to BF16.
                 torch.testing.assert_close(
-                    grad, ref_grad, atol=1e-3, rtol=3e-2, msg=lambda message, name=name: f"{name}: {message}"
+                    grad,
+                    ref_grad,
+                    atol=1e-3,
+                    rtol=3e-2,
+                    msg=lambda message, name=name, step=step: f"step={step}, {name}: {message}",
                 )
                 relative_error = (grad - ref_grad).norm() / ref_grad.norm().clamp_min(1e-8)
                 assert relative_error < 0.03, (name, relative_error)
             else:
                 torch.testing.assert_close(
-                    grad, ref_grad, atol=1e-6, rtol=1e-5, msg=lambda message, name=name: f"{name}: {message}"
+                    grad,
+                    ref_grad,
+                    atol=1e-6,
+                    rtol=1e-5,
+                    msg=lambda message, name=name, step=step: f"step={step}, {name}: {message}",
                 )
         optim.step()
         ref_optim.step()
@@ -228,11 +244,10 @@ def test_fused_head_matches_logits(model_type, backend, offload, tied, reference
             torch.testing.assert_close(
                 param.to_local(),
                 ref_param.to_local(),
-                # The logits reference can accumulate the accepted BF16
-                # gradient error over SGD steps (lr=0.1).
-                atol=(step + 1) * 1e-4 if reference_kind == "logits" else 1e-6,
+                # Each SGD update (lr=0.1) starts from identical weights.
+                atol=1e-4 if reference_kind == "logits" else 1e-6,
                 rtol=3e-2 if reference_kind == "logits" else 1e-5,
-                msg=lambda message, name=name: f"{name}: {message}",
+                msg=lambda message, name=name, step=step: f"step={step}, {name}: {message}",
             )
     model.eval()
     with torch.no_grad():
